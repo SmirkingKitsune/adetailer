@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import platform
 import re
+import os
 import sys
 import traceback
 from collections.abc import Sequence
@@ -109,6 +110,9 @@ class AfterDetailerScript(scripts.Script):
         self.ultralytics_device = self.get_ultralytics_device()
 
         self.controlnet_ext = None
+        
+        self.interrogator_plugin = None
+        self.init_interrogator_plugin()
 
     def __repr__(self):
         return f"{self.__class__.__name__}(version={__version__})"
@@ -118,7 +122,7 @@ class AfterDetailerScript(scripts.Script):
 
     def show(self, is_img2img):
         return scripts.AlwaysVisible
-
+    
     def ui(self, is_img2img):
         num_models = opts.data.get("ad_max_models", 2)
         ad_model_list = list(model_mapping.keys())
@@ -157,6 +161,43 @@ class AfterDetailerScript(scripts.Script):
                     f"[-] ADetailer: ControlNetExt init failed:\n{error}",
                     file=sys.stderr,
                 )
+
+    def init_interrogator_plugin(self):
+        """Initialize the interrogator plugin if available"""
+        try:
+            import importlib.util
+            import os
+            import sys
+
+            # Fixed path for the plugin
+            plugin_path = "extensions/sd-Img2img-batch-interrogator/scripts/sd_tag_batch.py"
+
+            if not os.path.exists(plugin_path):
+                self.interrogator_plugin = None
+                print("[-] ADetailer: Interrogator plugin not found at expected path")
+                return
+
+            module_name = "sd_tag_batch"
+            if module_name in sys.modules:
+                sd_tag_batch = sys.modules[module_name]
+            else:
+                spec = importlib.util.spec_from_file_location(module_name, plugin_path)
+                sd_tag_batch = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(sd_tag_batch)
+                sys.modules[module_name] = sd_tag_batch
+
+            if hasattr(sd_tag_batch, "interrogation_processor"):
+                self.interrogator_plugin = sd_tag_batch.interrogation_processor
+                print("[-] ADetailer: Interrogator plugin loaded successfully")
+            else:
+                self.interrogator_plugin = None
+                print("[-] ADetailer: Interrogator plugin found but missing interrogation_processor")
+
+        except Exception as e:
+            print(f"[-] ADetailer: Error loading interrogator plugin: {e}")
+            import traceback
+            traceback.print_exc()
+            self.interrogator_plugin = None
 
     def update_controlnet_args(self, p, args: ADetailerArgs) -> None:
         if self.controlnet_ext is None:
@@ -771,7 +812,12 @@ class AfterDetailerScript(scripts.Script):
     def process(self, p, *args_):
         if getattr(p, "_ad_disabled", False):
             return
-
+        
+        if hasattr(p, 'init_images') and p.init_images:
+            p._ad_initial_image = p.init_images[0].copy() if p.init_images[0] else None
+        else:
+            p._ad_initial_image = None
+        
         if is_img2img_inpaint(p) and is_all_black(self.get_image_mask(p)):
             p._ad_disabled = True
             msg = (
@@ -800,6 +846,84 @@ class AfterDetailerScript(scripts.Script):
 
         extra_params = self.extra_params(arg_list)
         p.extra_generation_params.update(extra_params)
+    
+    def get_interrogation_config(self, args: ADetailerArgs) -> dict:
+        """Create configuration for the interrogator plugin"""
+        return args.ad_interrogate_config
+    
+    def interrogate_detected_area(self, p, image: Image.Image, mask: Image.Image, args: ADetailerArgs) -> str:
+        """Interrogate a detected area using the plugin"""
+        if not args.ad_interrogate_enable or not self.interrogator_plugin:
+            return ""
+        
+        try:
+            # Get the bounding box and crop the image
+            bbox = mask.getbbox()
+            if bbox:
+                x1, y1, x2, y2 = bbox
+                padding = 50
+                x1 = max(0, x1 - padding)
+                y1 = max(0, y1 - padding)
+                x2 = min(image.width, x2 + padding)
+                y2 = min(image.height, y2 + padding)
+                cropped_image = image.crop((x1, y1, x2, y2))
+            else:
+                cropped_image = image
+            
+            # Get configuration from args
+            config = self.get_interrogation_config(args)
+
+            # Call the interrogation processor from the plugin
+            result = self.interrogator_plugin.process_batch(
+                p=p,
+                tag_batch_enabled=True,
+                model_selection=config.get('model_selection', ['CLIP (Native)']),
+                debug_mode=config.get('debug_mode', False),
+                in_front=config.get('in_front', 'Prepend to prompt'),
+                insert_target=config.get('insert_target', 'Prompt'),
+                insert_index=config.get('insert_index', 0),
+                prompt_weight_mode=config.get('prompt_weight_mode', False),
+                prompt_weight=config.get('prompt_weight', 0.5),
+                reverse_mode=config.get('reverse_mode', False),
+                exaggeration_mode=config.get('exaggeration_mode', False),
+                prompt_output=config.get('prompt_output', False),
+                use_positive_filter=config.get('use_positive_filter', False),
+                use_negative_filter=config.get('use_negative_filter', False),
+                use_custom_filter=config.get('use_custom_filter', False),
+                custom_filter=config.get('custom_filter', ''),
+                use_custom_replace=config.get('use_custom_replace', False),
+                custom_replace_find=config.get('custom_replace_find', ''),
+                custom_replace_replacements=config.get('custom_replace_replacements', ''),
+                clip_ext_model=config.get('clip_ext_model', []),
+                clip_ext_mode=config.get('clip_ext_mode', 'best'),
+                wd_ext_model=config.get('wd_ext_model', []),
+                wd_threshold=config.get('wd_threshold', 0.35),
+                wd_underscore_fix=config.get('wd_underscore_fix', True),
+                wd_append_ratings=config.get('wd_append_ratings', False),
+                wd_ratings=config.get('wd_ratings', 0.5),
+                wd_keep_tags=config.get('wd_keep_tags', ''),
+                unload_clip_models_afterwords=config.get('unload_clip_models_afterwords', True),
+                unload_wd_models_afterwords=config.get('unload_wd_models_afterwords', True),
+                no_puncuation_mode=config.get('no_puncuation_mode', False),
+                batch_number=0,
+                prompts=[p.prompt],
+                seeds=[p.seed],
+                subseeds=[p.subseed],
+                prompt_override="",
+                image_override=cropped_image,
+                update_p=False,
+            )
+
+            result = (result or "").strip().rstrip(',')
+            
+            if config.get('debug_mode', False):
+                print(f"[-] ADetailer: Interrogation result: {result}")
+            
+            return result
+            
+        except Exception as e:
+            print(f"[-] ADetailer: Error during interrogation: {e}")
+            return ""
 
     def _postprocess_image_inner(
         self, p, pp: PPImage, args: ADetailerArgs, *, n: int = 0
@@ -863,6 +987,57 @@ class AfterDetailerScript(scripts.Script):
             p2.image_mask = masks[j]
             p2.init_images[0] = ensure_pil_image(p2.init_images[0], "RGB")
             self.i2i_prompts_replace(p2, ad_prompts, ad_negatives, j)
+            
+            # Interrogate the detected area if enabled
+            if args.ad_interrogate_enable and self.interrogator_plugin:
+                try:
+                    interrogated_additions = []
+                    
+                    # Interrogate based on mode
+                    if args.ad_interrogate_mode in ["Initial", "Both"] and hasattr(p, '_ad_initial_image') and p._ad_initial_image:
+                        initial_result = self.interrogate_detected_area(p, p._ad_initial_image, masks[j], args)
+                        if initial_result:
+                            interrogated_additions.append(initial_result)
+                            
+                            # Get config from args
+                            config = self.get_interrogation_config(args)
+                            if config.get('debug_mode', False):
+                                print(f"[-] ADetailer: Initial image interrogation result: {initial_result}")
+                    
+                    if args.ad_interrogate_mode in ["Generated", "Both"]:
+                        generated_result = self.interrogate_detected_area(p, pp.image, masks[j], args)
+                        if generated_result:
+                            interrogated_additions.append(generated_result)
+                            
+                            # Get config from args
+                            config = self.get_interrogation_config(args)
+                            if config.get('debug_mode', False):
+                                print(f"[-] ADetailer: Generated image interrogation result: {generated_result}")
+                    
+                    # Combine results if we have multiple
+                    interrogated_addition = ", ".join(interrogated_additions)
+                    
+                    # Enhance with interrogation results if any
+                    if interrogated_addition:
+                        config = self.get_interrogation_config(args)
+                        
+                        # Apply prompt weighting if enabled
+                        if config.get('prompt_weight_mode', False) and config.get('prompt_weight', 1.0) != 1.0:
+                            weighted_addition = f"({interrogated_addition}:{config['prompt_weight']})"
+                        else:
+                            weighted_addition = interrogated_addition
+                        
+                        # Combine prompts based on configuration
+                        if config.get('in_front', 'Prepend to prompt') == "Prepend to prompt":
+                            p2.prompt = f"{weighted_addition}, {p2.prompt}"
+                        else:
+                            p2.prompt = f"{p2.prompt}, {weighted_addition}"
+                        
+                        if config.get('debug_mode', False):
+                            print(f"[-] ADetailer: Enhanced prompt for detection {j+1}: {p2.prompt}")
+                            
+                except Exception as e:
+                    print(f"[-] ADetailer: Error during interrogation for detection {j+1}: {e}")
 
             if re.match(r"^\s*\[SKIP\]\s*$", p2.prompt):
                 continue
@@ -927,8 +1102,8 @@ class AfterDetailerScript(scripts.Script):
                 p.scripts.process(copy_p)
 
         self.write_params_txt(params_txt_content)
-
-
+        
+    
 def on_after_component(component, **_kwargs):
     global txt2img_submit_button, img2img_submit_button
     if getattr(component, "elem_id", None) == "txt2img_generate":
@@ -1057,6 +1232,23 @@ def on_ui_settings():
         ),
     )
 
+    shared.opts.add_option(
+        "ad_interrogate_default_enable",
+        shared.OptionInfo(
+            default=False,
+            label="Enable interrogation by default for new ADetailer tabs",
+            section=section,
+        ),
+    )
+    
+    shared.opts.add_option(
+        "ad_interrogate_default_models",
+        shared.OptionInfo(
+            default="CLIP (Native)",
+            label="Default interrogation models",
+            section=section,
+        ),
+    )
 
 # xyz_grid
 
@@ -1171,6 +1363,12 @@ def make_axis_on_xyz_grid():
             str,
             partial(set_value, field="ad_controlnet_model"),
             choices=lambda: ["None", "Passthrough", *get_cn_models()],
+        ),
+        xyz_grid.AxisOption(
+            "[ADetailer] Interrogation mode 1st",
+            str,
+            partial(set_value, field="ad_interrogate_mode"),
+            choices=lambda: ["Generated", "Initial", "Both"],
         ),
     ]
 
