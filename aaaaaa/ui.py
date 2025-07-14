@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import gradio as gr
+import os
 
 from aaaaaa.conditional import InputAccordion
 from adetailer import ADETAILER, __version__
@@ -258,6 +259,8 @@ def one_ui_group(n: int, is_img2img: bool, webui_info: WebuiInfo):
             "Inpainting", open=False, elem_id=eid("ad_inpainting_accordion")
         ):
             inpainting(w, n, is_img2img, webui_info)
+
+        interrogation(w, n, is_img2img)
 
     with gr.Group():
         controlnet(w, n, is_img2img)
@@ -718,3 +721,142 @@ def controlnet(w: Widgets, n: int, is_img2img: bool):
                 interactive=controlnet_exists,
                 elem_id=eid("ad_controlnet_guidance_end"),
             )
+
+def interrogation(w: Widgets, n: int, is_img2img: bool):
+    eid = partial(elem_id, n=n, is_img2img=is_img2img)
+    
+    with gr.Accordion("Interrogation", open=False, elem_id=eid("ad_interrogation_accordion")):
+        w.ad_interrogate_enable = gr.Checkbox(
+            label="Enable interrogation for detected areas" + suffix(n),
+            value=False,
+            elem_id=eid("ad_interrogate_enable"),
+        )
+        
+        # Interrogation level widget
+        w.ad_interrogate_mode = gr.Radio(
+            label="Interrogation mode" + suffix(n),
+            choices=["Generated", "Initial", "Both"] if is_img2img else ["Generated"],
+            value="Generated",
+            visible=False,  # Start hidden, will be shown when enabled
+            elem_id=eid("ad_interrogate_mode"),
+        )
+        
+        # Create a hidden component to store the plugin's config
+        w.ad_interrogate_config = gr.JSON(
+            value={},
+            visible=False,
+            elem_id=eid("ad_interrogate_config"),
+        )
+        
+        # Create a container for the plugin's UI
+        with gr.Group(elem_id=eid("ad_interrogation_group"), visible=False) as interrogation_group:
+            # Add the mode selector first
+            mode_info = gr.HTML("")
+            if is_img2img:
+                mode_info = gr.HTML(
+                    "<p><b>Mode selection:</b> Choose whether to interrogate the "
+                    "initial image, generated image, or both.</p>"
+                )
+            else:
+                mode_info = gr.HTML(
+                    "<p><b>Note:</b> In txt2img mode, only the generated image can be interrogated.</p>"
+                    "<p>Initial image interrogation is available only in img2img mode.</p>"
+                )
+                # In txt2img mode, limit choices to Generated only
+                w.ad_interrogate_mode.choices = ["Generated"]
+                w.ad_interrogate_mode.value = "Generated"
+                
+            try:
+                import importlib.util
+                import os
+                import sys
+
+                # Fixed path for the plugin
+                plugin_path = "extensions/sd-Img2img-batch-interrogator/scripts/sd_tag_batch.py"
+
+                if not os.path.exists(plugin_path):
+                    gr.HTML(
+                        "<p style='color: red;'>Img2img Batch Interrogator plugin not found. "
+                        "Please install it to use this feature.</p>"
+                        f"<p>Expected at: {plugin_path}</p>"
+                    )
+                    w.ad_interrogate_ui_components = None
+                    return
+
+                module_name = "sd_tag_batch"
+                if module_name in sys.modules:
+                    sd_tag_batch = sys.modules[module_name]
+                else:
+                    spec = importlib.util.spec_from_file_location(module_name, plugin_path)
+                    sd_tag_batch = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(sd_tag_batch)
+                    sys.modules[module_name] = sd_tag_batch
+
+                if hasattr(sd_tag_batch, 'interrogation_processor'):
+                    plugin_components = sd_tag_batch.interrogation_processor.ui(is_img2img, skip_check=True)
+                    component_names = [
+                        'tag_batch_enabled', 'model_selection', 'debug_mode', 'in_front', 'insert_target', 'insert_index', 'prompt_weight_mode',
+                        'prompt_weight', 'reverse_mode', 'exaggeration_mode', 'prompt_output',
+                        'use_positive_filter', 'use_negative_filter', 'use_custom_filter', 'custom_filter',
+                        'use_custom_replace', 'custom_replace_find', 'custom_replace_replacements',
+                        'clip_ext_model', 'clip_ext_mode', 'wd_ext_model', 'wd_threshold',
+                        'wd_underscore_fix', 'wd_append_ratings', 'wd_ratings',
+                        'unload_clip_models_afterwords', 'unload_wd_models_afterwords', 'no_puncuation_mode'
+                    ]
+                    w.ad_interrogate_ui_components = {
+                        name: comp for name, comp in zip(component_names, plugin_components)
+                    }
+
+                    ui_dict = w.ad_interrogate_ui_components
+
+                    input_components = [ui_dict[name] for name in component_names if name in ui_dict]
+
+                    def capture_plugin_config(*values):
+                        config = {}
+                        for i, name in enumerate(component_names):
+                            if i < len(values) and name in ui_dict:
+                                config[name] = values[i]
+
+                        if not config.get('model_selection'):
+                            config['model_selection'] = ['CLIP (Native)']
+
+                        return config
+
+                    for component_name in component_names:
+                        if component_name in ui_dict:
+                            component = ui_dict[component_name]
+                            if hasattr(component, 'change'):
+                                component.change(
+                                    fn=capture_plugin_config,
+                                    inputs=input_components,
+                                    outputs=[w.ad_interrogate_config],
+                                    show_progress=False,
+                                )
+
+                    gr.HTML("<p><em>Interrogation settings will be used when processing detected areas.</em></p>")
+                else:
+                    gr.HTML("<p style='color: red;'>Interrogator plugin found but missing interrogation_processor.</p>")
+                    w.ad_interrogate_ui_components = None
+                    
+            except Exception as e:
+                import traceback
+                gr.HTML(
+                    f"<p style='color: red;'>Error loading interrogator plugin: {str(e)}</p>"
+                    f"<pre>{traceback.format_exc()}</pre>"
+                )
+                w.ad_interrogate_ui_components = None
+        
+        # Update visibility handlers to show both mode and group
+        def toggle_interrogation_visibility(enabled):
+            mode_visible = enabled and is_img2img  # Mode selector only visible in img2img
+            return [
+                gr.update(visible=mode_visible),  # ad_interrogate_mode
+                gr.update(visible=enabled),       # interrogation_group
+            ]
+        
+        w.ad_interrogate_enable.change(
+            fn=toggle_interrogation_visibility,
+            inputs=[w.ad_interrogate_enable],
+            outputs=[w.ad_interrogate_mode, interrogation_group],
+            show_progress=False,
+        )
